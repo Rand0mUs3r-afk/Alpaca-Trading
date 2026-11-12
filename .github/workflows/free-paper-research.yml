@@ -1,0 +1,78 @@
+name: Free AI - Paper research
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Check the paper account or run the AI team (no orders)
+        required: true
+        default: check
+        type: choice
+        options: [check, analyze]
+      ticker:
+        description: One US stock symbol
+        required: true
+        default: AAPL
+        type: string
+      model:
+        description: Gemini model - your API project must be on the free tier
+        required: true
+        default: gemini-3.8-flash
+        type: choice
+        options: [gemini-3.8-flash, gemini-3.6-flash]
+      free_tier_confirmed:
+        description: I confirm my Google API project has billing disabled
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: free-paper-research
+  cancel-in-progress: false
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONPATH: .
+      ALPACA_USE_PAPER: 'True'
+      RUN_MODE: ${{ inputs.mode }}
+      RUN_TICKER: ${{ inputs.ticker }}
+      RUN_MODEL: ${{ inputs.model }}
+      FREE_TIER_CONFIRMED: ${{ inputs.free_tier_confirmed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Test the free-runner policy (no network)
+        run: python -m unittest discover -s tests -p test_free_actions.py -v
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt 'fastembed>=0.4,<1'
+      - name: Run selected task
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_EXPECTED_PAPER_ACCOUNT_ID: ${{ secrets.ALPACA_EXPECTED_PAPER_ACCOUNT_ID }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python -m scripts.free_actions --mode "$RUN_MODE" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED"
+      - name: Save sanitized result
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: free-paper-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/free-actions/result.json
+          retention-days: 3
+          if-no-files-found: ignore
