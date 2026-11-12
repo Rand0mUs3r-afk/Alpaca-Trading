@@ -74,7 +74,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
-          python -m scripts.free_groq_limits --mode "$RUN_MODE" --provider "$RUN_PROVIDER" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED"
+          python -m scripts.free_request_fit --mode "$RUN_MODE" --provider "$RUN_PROVIDER" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED"
       - name: Save sanitized result
         if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@v4
