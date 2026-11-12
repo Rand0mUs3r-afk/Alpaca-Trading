@@ -134,16 +134,19 @@ class ProviderTests(unittest.TestCase):
             self.assertIs(graph_module.FinancialSituationMemory, memory_class)
 
     def test_main_groq_only_with_mocked_graph(self):
+        import importlib
         import os
         import sys
         import tempfile
         from pathlib import Path
-        from unittest.mock import patch
+        from unittest.mock import Mock, patch
+        # Reproduce full-suite order even when this test runs alone.
+        importlib.import_module('scripts.free_actions')
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / 'result.json'
             base = SimpleNamespace(
                 REPORT=report, REPORTS=('market_report',),
-                validate=lambda *args: None,
+                validate=Mock(return_value=None),
                 paper_check=lambda: {'paper_account_verified': True, 'orders_enabled': False},
                 install_free_tools=lambda: None, install_local_memory=lambda: None,
                 redact=lambda text: text)
@@ -156,8 +159,9 @@ class ProviderTests(unittest.TestCase):
             }
             env = {'GROQ_API_KEY': 'groq-test-key', 'SEC_USER_AGENT': 'Test test@example.com'}
             argv = ['runner', '--mode', 'analyze', '--provider', 'groq', '--free-tier-confirmed', 'true']
-            with patch.dict(sys.modules, modules), patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv), patch.object(free, 'install_http_guard', lambda: None), patch.object(free, 'install_clients', lambda: FakeGraph), patch.object(free, 'run_graph', lambda *args: FakeGraph()):
+            with patch.dict(sys.modules, modules), patch('scripts.free_actions', base, create=True), patch.dict(os.environ, env, clear=True), patch.object(sys, 'argv', argv), patch.object(free, 'install_http_guard', lambda: None), patch.object(free, 'install_clients', lambda: FakeGraph), patch.object(free, 'run_graph', lambda *args: FakeGraph()):
                 self.assertEqual(free.main(), 0)
+            base.validate.assert_called_once_with('AAPL', 'check', free.GEMINI_MODELS[0], False)
             result = json.loads(report.read_text())
             self.assertEqual(result['provider'], 'groq')
             self.assertEqual(result['model'], free.GROQ_MODEL)
