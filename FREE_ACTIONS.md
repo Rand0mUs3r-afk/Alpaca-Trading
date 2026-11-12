@@ -1,74 +1,70 @@
-# Free AI paper research: Gemini with Groq backup
+# Free paper research with Gemini/Groq and quota handling
 
-This manual Actions workflow checks your Alpaca PAPER account and runs the existing
-five analysts, debates and risk review. It DOES NOT submit, cancel or replace orders.
-There is no schedule or permanently hosted dashboard.
+This is research only: no orders, cancellations, live trading, schedule or permanent
+web dashboard. The existing five analysts and debates remain.
 
-## Actions secrets
+## Secrets and running
 
-Settings -> Secrets and variables -> Actions -> New repository secret.
+Repository Settings -> Secrets and variables -> Actions.
+Required: ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_EXPECTED_PAPER_ACCOUNT_ID.
+For analysis add SEC_USER_AGENT (your name and contact email) and at least one of:
+- GOOGLE_API_KEY from a Google project with paid billing disabled.
+- GROQ_API_KEY from the Groq Free plan.
+Optional: FRED_API_KEY, FINNHUB_API_KEY. Only use permitted free-access endpoints.
+No OpenAI key is needed or passed. The app cannot inspect your billing plan.
 
-Required for account check:
-- ALPACA_API_KEY: paper key.
-- ALPACA_SECRET_KEY: matching paper secret.
-- ALPACA_EXPECTED_PAPER_ACCOUNT_ID: account ID, not API key or account number.
+Actions -> Free AI - Paper research -> Run workflow -> main.
+Choose check for account verification, or analyze with one stock such as AAPL.
+Provider groq uses openai/gpt-oss-120b at Groq, not at OpenAI. Provider auto tries
+configured Gemini then Groq; provider gemini uses Google only. The model dropdown
+selects only the Gemini model and is ignored in Groq mode. Confirm free billing.
+Read the Summary and sanitized artifact; public runs have public research results.
 
-For analysis:
-- GROQ_API_KEY: your Groq FREE-plan API key. Required for the Groq route/backup.
-- GOOGLE_API_KEY: your Gemini key on an unbilled free-tier project. Optional if using Groq only.
-- SEC_USER_AGENT: your name and contact email, for SEC filings.
-- FRED_API_KEY and FINNHUB_API_KEY: optional data keys, using only your permitted access.
+## Groq quota handling
 
-Do not add an OpenAI key. The workflow passes no OpenAI/Anthropic/OpenRouter key.
-It cannot verify your provider billing plans. Confirm the supplied keys are free-plan
-keys with paid billing disabled; a model name alone does not prevent charges on a
-paid account. Free quotas can stop the run. No paid fallback is configured.
+Groq output is capped at 2048 tokens rather than 4096. Retrieved downstream report
+context is reduced to 2400 tokens with at most 8 chunks and 6000 memory characters.
+This keeps all five roles but can reduce report detail and change decisions. It is
+not an equal-accuracy, equal-hit-rate or profitability guarantee.
 
-## Run from the browser
+Before a synchronous Groq chat request, the wrapper estimates input plus reserved
+output plus 256 tokens of overhead. It uses a compatible local tiktoken encoding
+if available, otherwise a conservative byte-length estimate. This is NOT an exact
+Groq token count. A request above the configured 7500-token budget is stopped
+before sending, without silently cutting messages or tool results.
 
-Actions -> Free AI - Paper research -> Run workflow -> branch main.
+A conservative rolling 65-second reservation window reduces token/minute bursts.
+Observed server token limits can lower the local budget. Server remaining-token
+and reset headers are honored. Other apps using the same organization can still
+consume quota and cause 429s. Cached input can make this policy over-conservative.
 
-1. Choose check for an account check (no model request).
-2. Choose analyze, ticker AAPL, and provider groq to test Groq directly.
-   Groq uses openai/gpt-oss-120b through Groq, not through an OpenAI account.
-3. Choose provider auto for Gemini first, then Groq if Gemini is unavailable.
-4. The Gemini model input only selects the Google model. It is ignored by Groq.
-5. Tick the free-plan confirmation only after checking your provider accounts.
-6. Read Summary and the sanitized result artifact. provider/model show the actual
-   successful provider; provider_attempts records failures and HTTP codes.
+For 429s, the wrapper reads numeric rate-limit/reset headers and classifies the
+response without printing raw response text or organization IDs. It waits for
+Retry-After/token reset when available, otherwise 65 seconds. At most three HTTP
+attempts are allowed per synchronous quota-limited Groq call. A reset requiring
+more than 120 seconds stops the request instead of sleeping indefinitely.
 
-If you create a run using groq only, no Google key is required. In auto mode only
-providers with configured keys are attempted. An absent backup key is not invented.
+Known daily quota exhaustion and requests reported above the provider's limit stop
+without futile retries. The result distinguishes GROQ_DAILY_QUOTA_EXHAUSTED,
+GROQ_REQUEST_TOO_LARGE, GROQ_RESET_TOO_FAR_AWAY and minute/unknown limits. A local
+preflight rejection is explicitly marked quota_source=local_preflight; its status
+is not a claim that Groq returned that response. Unknown 429s can still exhaust the
+bounded retries. Free quotas cannot be bypassed and are not guaranteed sufficient.
 
-## Retry and fallback rules
+## Other behavior
 
-Each model-generation call has at most two wrapper attempts for transient 408/5xx
-failures, with a 20-second wait. Gemini SDK retry setting is 1; Groq SDK retries are 0.
-The SDK may therefore perform additional bounded HTTP requests inside a wrapper
-attempt. A 429 does not loop on the same provider. After a provider failure, auto
-may restart the ENTIRE analysis with the next provider for 404/408/429/selected 5xx
-or recognized connection timeouts. It does not switch on coding errors, bad-key
-401s, permission 403s or malformed-request 400s. No in-progress tool conversation
-or provider-specific thought signatures are passed between providers.
+The previous bounded 408/5xx retries and whole-analysis provider fallback remain.
+Authentication, permission and coding failures do not silently switch providers.
+The workflow timeout is 90 minutes to allow quota waits; Cancel workflow still stops
+it. It runs only when manually started, on standard public GitHub-hosted runners.
+No new secrets or paid fallback are introduced.
 
-The graph and all five analyst roles remain. Synchronous calls are paced and
-analysts run sequentially. This is not an equal-accuracy or profitability claim.
-Free Groq token limits may be smaller than the assembled research prompt or total
-run; a provider can therefore still fail even though its account is free.
+RSS headlines and SEC Company Facts still replace hosted search; unavailable social
+or optional data remains a limitation. Local FastEmbed memory starts fresh each run.
+Read-only broker guards remain. HTTP quotas are handled for the synchronous Groq
+adapter used here, not as a general-purpose async/network sandbox.
 
-## Data, memory, privacy and limits
-
-Existing free RSS headline retrieval and SEC Company Facts replace hosted OpenAI
-search. This is not full-article or complete social-data coverage. Local FastEmbed
-embeddings are used. Memory starts fresh each Actions run, with separate stores
-for provider attempts. All current broker operations are read-only.
-
-The exact approved Groq chat-completions endpoint is allowed; known unapproved AI
-endpoints and Alpaca writes/live trading are blocked through Requests/HTTPX. This
-is defense in depth, not an operating-system sandbox. Public Actions logs and
-research summaries are visible. No raw graph/memory databases are uploaded.
-
-Standard public GitHub-hosted runners are used. Keep within GitHub/provider policies.
-Unit tests use mocks; they do not certify a successful live Gemini/Groq integration
-or successful execution of the complete analyst graph. Automatic paper orders
-remain a separate, unimplemented feature pending end-to-end verification.
+Offline tests use fake clocks/responses and do not prove a complete live analysis.
+Check the full GitHub test run and then one real model run. A request still too large
+needs a deliberately smaller evidence profile or another suitable free provider;
+repeatedly rerunning it will not solve a per-request budget failure.
