@@ -1,6 +1,7 @@
 """Offline tests for the diagnostic helper; no AI or broker requests."""
 import json
 import unittest
+from types import SimpleNamespace
 from scripts import free_actions_debug as debug
 
 
@@ -47,6 +48,39 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_non_json_is_unchanged(self):
         self.assertEqual(debug.enrich_result('not-json'), 'not-json')
+
+    def test_decorator_factory_accepts_arguments(self):
+        @debug.observed('local_embeddings')
+        def add(left, right=0):
+            return left + right
+        self.assertEqual(add(2, right=3), 5)
+        self.assertEqual(add.__name__, 'add')
+        self.assertEqual(debug.STAGE, 'local_embeddings')
+
+    def test_decorator_factory_records_failures(self):
+        @debug.observed('local_embeddings')
+        def fail():
+            raise ValueError('not-public')
+        with self.assertRaises(ValueError):
+            fail()
+        self.assertEqual(debug.FAILURE['error_stage'], 'local_embeddings')
+
+    def test_install_smoke_does_not_start_models_or_broker(self):
+        calls = []
+        def untouched(*args, **kwargs):
+            calls.append('called')
+        base = SimpleNamespace(
+            MODELS=('gemini-3.8-flash', 'gemini-3.6-flash'),
+            validate=untouched, install_http_guard=untouched,
+            paper_check=untouched, analyze=untouched,
+            install_free_tools=untouched, install_local_memory=untouched,
+            redact=lambda text: text)
+        debug.install(base)
+        self.assertEqual(calls, [])
+        self.assertTrue(callable(base.install_local_memory))
+        report = json.loads(base.redact(json.dumps({'status': 'FAILED', 'orders_enabled': False})))
+        self.assertFalse(report['orders_enabled'])
+        self.assertEqual(report['last_stage'], 'startup')
 
 
 if __name__ == '__main__':

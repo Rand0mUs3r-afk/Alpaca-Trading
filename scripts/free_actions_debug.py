@@ -38,7 +38,9 @@ def capture_failure(exc):
     # Never publish exception messages, input values, headers or response bodies.
 
 
-def observed(stage, function):
+def observed(stage, function=None):
+    if function is None:
+        return functools.partial(observed, stage)
     @functools.wraps(function)
     def call(*args, **kwargs):
         global STAGE
