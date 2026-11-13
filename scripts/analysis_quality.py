@@ -28,6 +28,8 @@ BAD = ('did not return', 'tools were unavailable', 'tools unavailable',
 FAILED_REPORT_HEADING = re.compile(
     r'^\s*#{1,6}\s*(?:fundamentals?|market|technical|news|social|sentiment|macro)\s+(?:analysis\s+)?error\b',
     re.IGNORECASE | re.MULTILINE)
+GLOBAL_MACRO_CONTEXTS = frozenset(('', 'market', 'markets', 'financial markets',
+    'global', 'global markets', 'us', 'us economy', 'u.s. economy'))
 
 
 class InvalidModelReply(ValueError):
@@ -114,6 +116,16 @@ def usable_report(value):
             and not any(marker in text.lower() for marker in BAD))
 
 
+def macro_context_matches(value, symbol):
+    """Recognize broad macro context without treating another ticker as a match."""
+    if value is None:
+        return True
+    if not isinstance(value, str):
+        return False
+    context = ' '.join(value.casefold().split())
+    return context in GLOBAL_MACRO_CONTEXTS or context == symbol.casefold()
+
+
 def receipt_ok(receipt, group, symbol):
     if receipt.get('tool_name') not in TOOLS[group] or receipt.get('status') != 'success':
         return False
@@ -122,8 +134,17 @@ def receipt_ok(receipt, group, symbol):
     inputs = receipt.get('inputs') or {}
     supplied = inputs.get('ticker') or inputs.get('symbol')
     query = str(inputs.get('query', ''))
+    if group == 'macro' and not macro_context_matches(inputs.get('ticker_context'), symbol):
+        return False
     if supplied:
         if str(supplied).upper() != symbol:
+            return False
+    elif group == 'macro':
+        # Global inputs have no stock ticker. Require the trusted tool runner's
+        # current-attempt symbol instead; do not rewrite the actual tool inputs.
+        if receipt.get('symbol') != symbol:
+            return False
+        if query and symbol not in re.findall(r'[A-Z][A-Z0-9.\-]*', query.upper()):
             return False
     elif symbol not in re.findall(r'[A-Z][A-Z0-9.\-]*', query.upper()):
         return False
@@ -211,6 +232,11 @@ def self_test():
             receipts.append({'symbol': 'AAPL', 'tool_name': tool, 'status': 'success',
                              'inputs': {'ticker': 'AAPL'}, 'output': json.dumps(output)})
         return reports, receipts
+    def macro_receipt(context='financial markets'):
+        return {'symbol': 'AAPL', 'tool_name': 'get_macro_news_openai', 'status': 'success',
+                'inputs': {'curr_date': '2026-11-12', 'ticker_context': context},
+                'output': json.dumps({'source': 'Google News RSS', 'available': True,
+                    'items': [{'title': 'Economic headline', 'url': 'https://example.com/macro'}]})}
     class Tests(unittest.TestCase):
         def test_canonical_tool_call_gets_legacy_wire_form(self):
             original = message(); original.tool_calls = [{'id': 'call_1', 'name': 'get_technical_brief', 'args': {'ticker': 'AAPL'}}]
@@ -309,6 +335,54 @@ def self_test():
             self.assertEqual(result['status'], 'ANALYSIS_INCOMPLETE')
             self.assertEqual(result['signal'], 'NO_TRADE')
             self.assertEqual(result['model_signal'], 'BUY')
+            self.assertFalse(result['orders_enabled'])
+        def test_broad_macro_context_accepts_scoped_receipt_without_mutation(self):
+            receipt = macro_receipt()
+            saved = copy.deepcopy(receipt)
+            reports, receipts = fixtures()
+            reports['macro_report'] = 'Source-based macro narrative with explicit limitations. ' * 3
+            result = assess(reports, receipts + [receipt], 'AAPL')
+            self.assertTrue(result['passed'])
+            self.assertEqual(result['accepted_tools']['macro'], ['get_macro_news_openai'])
+            self.assertEqual(receipt, saved)
+            self.assertNotIn('ticker', receipt['inputs'])
+        def test_broad_macro_context_normalizes_case_and_spacing(self):
+            self.assertTrue(receipt_ok(macro_receipt('  FINANCIAL   MARKETS  '), 'macro', 'AAPL'))
+        def test_macro_context_rejects_another_ticker_or_invalid_type(self):
+            for context in ('TSLA', {'ticker': 'AAPL'}):
+                with self.subTest(context_type=type(context).__name__):
+                    self.assertFalse(receipt_ok(macro_receipt(context), 'macro', 'AAPL'))
+        def test_global_macro_requires_trusted_attempt_symbol(self):
+            for value in (None, 'TSLA'):
+                receipt = macro_receipt(); receipt['symbol'] = value
+                self.assertFalse(receipt_ok(receipt, 'macro', 'AAPL'))
+        def test_macro_rejects_conflicting_explicit_ticker_or_query(self):
+            for key, value in (('ticker', 'TSLA'), ('query', 'TSLA news')):
+                receipt = macro_receipt(); receipt['inputs'][key] = value
+                self.assertFalse(receipt_ok(receipt, 'macro', 'AAPL'))
+        def test_global_macro_still_rejects_failed_or_suspect_outputs(self):
+            cases = [{'status': 'error'}, {'quality_details': {'is_suspect': True}},
+                     {'error_details': {'error_type': 'TimeoutError'}},
+                     {'output': json.dumps({'source': 'Google News RSS', 'available': False, 'items': []})}]
+            for changes in cases:
+                receipt = macro_receipt(); receipt.update(changes)
+                self.assertFalse(receipt_ok(receipt, 'macro', 'AAPL'))
+        def test_global_macro_cannot_override_failed_core_or_failed_report(self):
+            reports, receipts = fixtures()
+            reports['macro_report'] = 'Source-based macro narrative with explicit limitations. ' * 3
+            reports['market_report'] = ''
+            result = assess(reports, receipts + [macro_receipt()], 'AAPL')
+            self.assertFalse(result['passed'])
+            self.assertIn('UNVERIFIED_MARKET', result['reasons'])
+            self.assertEqual(result['reports']['macro'], 'verified')
+            reports, receipts = fixtures()
+            reports['macro_report'] = '# Macro Analysis Error\n' + 'Provider failure prevented completion. ' * 5
+            self.assertFalse(assess(reports, receipts + [macro_receipt()], 'AAPL')['passed'])
+        def test_global_macro_fix_does_not_enable_orders(self):
+            reports, receipts = fixtures()
+            reports['macro_report'] = 'Source-based macro narrative with explicit limitations. ' * 3
+            result = execution_payload(reports, 'HOLD', receipts + [macro_receipt()], 'AAPL')
+            self.assertTrue(result['evidence_quality']['passed'])
             self.assertFalse(result['orders_enabled'])
     return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests)).wasSuccessful()
 
