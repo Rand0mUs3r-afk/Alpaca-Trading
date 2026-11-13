@@ -60,6 +60,15 @@ def _social_text(content):
 
 def create_social_media_analyst(llm, toolkit):
     def social_media_analyst_node(state):
+        enabled = toolkit.config.get("social_llm_enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("SOCIAL_INVALID_LLM_SETTING")
+        if not enabled:
+            # Explicitly unavailable, not neutral or bullish. No tools, model
+            # calls, fabricated metrics, or final trade proposal in this path.
+            report = "UNAVAILABLE: Social sentiment not measured in free profile."
+            print("[SOCIAL] Skipped: social_llm_enabled=False; no sentiment measured.", flush=True)
+            return {"messages": [AIMessage(content=report)], "sentiment_report": report}
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         is_crypto = "/" in ticker or "USD" in ticker.upper() or "USDT" in ticker.upper()
@@ -161,3 +170,51 @@ def create_social_media_analyst(llm, toolkit):
             result = AIMessage(content=analysis_content)
         return {"messages": [result], "sentiment_report": result.content}
     return social_media_analyst_node
+
+
+def self_test():
+    """Offline disabled-path checks; no model, data-tool, or broker requests."""
+    import unittest
+    from types import SimpleNamespace
+    from contextlib import redirect_stdout
+    from io import StringIO
+    class NoModelCalls:
+        def __getattr__(self, name):
+            raise AssertionError("Model access is forbidden in disabled social analysis")
+    class Tests(unittest.TestCase):
+        def node(self, setting=False):
+            return create_social_media_analyst(NoModelCalls(),
+                SimpleNamespace(config={"social_llm_enabled": setting}))
+        def test_disabled_path_needs_no_tools_or_state_fields(self):
+            with redirect_stdout(StringIO()):
+                result = self.node()({})
+            self.assertTrue(result["sentiment_report"].startswith("UNAVAILABLE:"))
+            self.assertEqual(len(result["messages"]), 1)
+        def test_report_is_short_and_not_a_trade_signal(self):
+            with redirect_stdout(StringIO()):
+                result = self.node()({})
+            report = result["sentiment_report"]
+            self.assertLess(len(report), 80)
+            self.assertNotIn("FINAL TRANSACTION PROPOSAL", report)
+            self.assertNotIn("BUY", report)
+            self.assertNotIn("SELL", report)
+            self.assertFalse(getattr(result["messages"][0], "tool_calls", []))
+        def test_disabled_path_does_not_mutate_input_state(self):
+            prior = AIMessage(content="Prior report")
+            state = {"messages": [prior], "company_of_interest": "AAPL"}
+            with redirect_stdout(StringIO()):
+                self.node()(state)
+            self.assertEqual(state, {"messages": [prior], "company_of_interest": "AAPL"})
+        def test_malformed_setting_fails_before_model_or_tool_access(self):
+            for setting in ("false", None, 0):
+                with self.subTest(setting_type=type(setting).__name__):
+                    with self.assertRaisesRegex(ValueError, "SOCIAL_INVALID_LLM_SETTING"):
+                        self.node(setting)({})
+    return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests)).wasSuccessful()
+
+
+if __name__ == '__main__':
+    import sys
+    if sys.argv[1:] != ['--self-test']:
+        raise SystemExit('Only --self-test is available as a command.')
+    raise SystemExit(0 if self_test() else 1)
