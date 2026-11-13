@@ -10,14 +10,20 @@ on:
         type: choice
         options: [check, analyze, paper]
       provider:
-        description: Auto tries Gemini then Groq; groq skips Google
+        description: AI provider; auto selection uses the first configured provider
         required: true
         default: auto
         type: choice
         options: [auto, groq, gemini]
-      ticker:
-        description: One US stock symbol
+      ticker_source:
+        description: Yahoo plus AI for analyze only; manual is required for paper
         required: true
+        default: yahoo_most_active
+        type: choice
+        options: [yahoo_most_active, manual]
+      ticker:
+        description: US stock symbol for manual selection; ignored for Yahoo selection
+        required: false
         default: AAPL
         type: string
       model:
@@ -53,6 +59,7 @@ jobs:
       ALPACA_USE_PAPER: 'True'
       RUN_MODE: ${{ inputs.mode }}
       RUN_PROVIDER: ${{ inputs.provider }}
+      RUN_TICKER_SOURCE: ${{ inputs.ticker_source || 'manual' }}
       RUN_TICKER: ${{ inputs.ticker }}
       RUN_MODEL: ${{ inputs.model }}
       FREE_TIER_CONFIRMED: ${{ inputs.free_tier_confirmed }}
@@ -67,6 +74,10 @@ jobs:
           cache: pip
       - name: Check selected mode confirmations
         run: |
+          if [[ "$RUN_MODE" == "paper" && "$RUN_TICKER_SOURCE" != "manual" ]]; then
+            echo "Yahoo AI selection is analyze-only. Choose manual ticker selection for paper mode."
+            exit 1
+          fi
           if [[ "$RUN_MODE" == "paper" && "$PAPER_ORDERS_CONFIRMED" != "true" ]]; then
             echo "Paper mode requires the paper-orders confirmation checkbox."
             exit 1
@@ -80,6 +91,7 @@ jobs:
           python -m unittest discover -s tests -p 'test_free_*.py' -v
           python -m scripts.paper_executor --self-test
           python -m scripts.analysis_quality --self-test
+          python -m scripts.yahoo_ticker_selection --self-test
           python -m scripts.paper_trading_runner --self-test
       - name: Install dependencies
         run: python -m pip install -r requirements.txt 'fastembed>=0.4,<1'
@@ -94,7 +106,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
-          python -m scripts.paper_trading_runner --mode "$RUN_MODE" --provider "$RUN_PROVIDER" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED" --paper-orders-confirmed "$PAPER_ORDERS_CONFIRMED"
+          python -m scripts.paper_trading_runner --mode "$RUN_MODE" --provider "$RUN_PROVIDER" --ticker-source "$RUN_TICKER_SOURCE" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED" --paper-orders-confirmed "$PAPER_ORDERS_CONFIRMED"
       - name: Save sanitized result
         if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@v4
