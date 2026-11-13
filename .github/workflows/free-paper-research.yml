@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Check the paper account or run research (no orders)
+        description: Check, analyze only, or explicitly confirmed paper execution
         required: true
         default: check
         type: choice
-        options: [check, analyze]
+        options: [check, analyze, paper]
       provider:
         description: Auto tries Gemini then Groq; groq skips Google
         required: true
@@ -28,6 +28,11 @@ on:
         options: [gemini-3.8-flash, gemini-3.6-flash]
       free_tier_confirmed:
         description: I confirm all supplied AI keys use free plans with paid billing disabled
+        required: true
+        default: false
+        type: boolean
+      paper_orders_confirmed:
+        description: I explicitly confirm a paper BUY order may be submitted only after the code gates pass
         required: true
         default: false
         type: boolean
@@ -51,6 +56,7 @@ jobs:
       RUN_TICKER: ${{ inputs.ticker }}
       RUN_MODEL: ${{ inputs.model }}
       FREE_TIER_CONFIRMED: ${{ inputs.free_tier_confirmed }}
+      PAPER_ORDERS_CONFIRMED: ${{ inputs.paper_orders_confirmed }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -59,8 +65,22 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-      - name: Test free-model policies (no network)
-        run: python -m unittest discover -s tests -p 'test_free_*.py' -v
+      - name: Check selected mode confirmations
+        run: |
+          if [[ "$RUN_MODE" == "paper" && "$PAPER_ORDERS_CONFIRMED" != "true" ]]; then
+            echo "Paper mode requires the paper-orders confirmation checkbox."
+            exit 1
+          fi
+          if [[ "$RUN_MODE" != "check" && "$FREE_TIER_CONFIRMED" != "true" ]]; then
+            echo "Analysis and paper modes require the free-plan confirmation checkbox."
+            exit 1
+          fi
+      - name: Test free-model and paper-executor policies (no network)
+        run: |
+          python -m unittest discover -s tests -p 'test_free_*.py' -v
+          python -m scripts.paper_executor --self-test
+          python -m scripts.analysis_quality --self-test
+          python -m scripts.paper_trading_runner --self-test
       - name: Install dependencies
         run: python -m pip install -r requirements.txt 'fastembed>=0.4,<1'
       - name: Run selected task
@@ -74,7 +94,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: |
-          python -m scripts.free_schema_compat --mode "$RUN_MODE" --provider "$RUN_PROVIDER" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED"
+          python -m scripts.paper_trading_runner --mode "$RUN_MODE" --provider "$RUN_PROVIDER" --ticker "$RUN_TICKER" --model "$RUN_MODEL" --free-tier-confirmed "$FREE_TIER_CONFIRMED" --paper-orders-confirmed "$PAPER_ORDERS_CONFIRMED"
       - name: Save sanitized result
         if: ${{ always() && !cancelled() }}
         uses: actions/upload-artifact@v4
