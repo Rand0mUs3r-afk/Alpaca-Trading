@@ -175,6 +175,7 @@ def run_graph(provider, model, graph_class):
     config.update(llm_provider=provider, quick_think_llm=model, deep_think_llm=model,
                   quick_llm_params={}, deep_llm_params={}, backend_url=None,
                   openai_api_key=None, openai_use_local=False, online_tools=True,
+                  social_llm_enabled=False,
                   alpaca_use_paper='True', allow_shorts=False,
                   parallel_analysts=False, parallel_risk_first_round=False,
                   tool_semantic_retry_enabled=False,
