@@ -1,8 +1,7 @@
-"""Step 2: tool-call compatibility and conservative report/provenance checks.
-Not yet wired to Actions or paper execution. No model or broker requests here.
+"""Tool-call compatibility and conservative report/provenance checks.
 'verified' means an acceptable report plus a matching successful tool receipt,
-not a proof that every natural-language claim is correct or a trade will profit.
-Receipts must come from the application's tool runner, never from model assertions.
+not proof that every natural-language claim is correct or a trade will profit.
+Receipts must come from the application's tool runner, never model assertions.
 Run offline checks: python -m scripts.analysis_quality --self-test
 """
 import copy
@@ -23,7 +22,12 @@ TOOLS = {
 }
 BAD = ('did not return', 'tools were unavailable', 'tools unavailable',
        "i can't provide", 'i cannot provide', "i can't generate", 'please provide the analysis',
-       'technical basis is insufficient', 'tool-loop halted', 'analysis was limited')
+       'technical basis is insufficient', 'tool-loop halted', 'analysis was limited',
+       'analysis encountered an error and could not complete successfully',
+       'unable to perform fundamental analysis', 'incomplete analysis')
+FAILED_REPORT_HEADING = re.compile(
+    r'^\s*#{1,6}\s*(?:fundamentals?|market|technical|news|social|sentiment|macro)\s+(?:analysis\s+)?error\b',
+    re.IGNORECASE | re.MULTILINE)
 
 
 class InvalidModelReply(ValueError):
@@ -106,7 +110,8 @@ def clean_text(value):
 
 def usable_report(value):
     text = clean_text(value)
-    return len(text) >= 80 and not any(marker in text.lower() for marker in BAD)
+    return (len(text) >= 80 and not FAILED_REPORT_HEADING.search(text)
+            and not any(marker in text.lower() for marker in BAD))
 
 
 def receipt_ok(receipt, group, symbol):
@@ -278,6 +283,33 @@ def self_test():
         def test_never_extracts_trade_intent_from_prose(self):
             reports, receipts = fixtures(); reports['final_trade_decision'] = 'BUY with stop 98 and target 105'
             self.assertIsNone(execution_payload(reports, 'BUY', receipts, 'AAPL')['trade_intent'])
+        def test_legacy_fundamentals_failure_with_successful_receipt_is_blocked(self):
+            reports, receipts = fixtures()
+            reports['fundamentals_report'] = ('# Fundamentals Analysis Error\n\n'
+                'The fundamentals analysis encountered an error and could not complete successfully.\n'
+                'Unable to perform fundamental analysis for this symbol. Incomplete Analysis.')
+            result = assess(reports, receipts, 'AAPL')
+            self.assertFalse(result['passed'])
+            self.assertEqual(result['reports']['fundamentals'], 'unverified')
+            self.assertEqual(result['accepted_tools']['fundamentals'], ['get_fundamentals_openai'])
+        def test_failure_headings_block_other_reports(self):
+            for name in ('Market', 'News', 'Social', 'Macro'):
+                with self.subTest(name=name):
+                    self.assertFalse(usable_report('# ' + name + ' Analysis Error\n' + 'Failure details for review. ' * 5))
+        def test_explicit_incomplete_analysis_blocks(self):
+            self.assertFalse(usable_report('Incomplete Analysis. ' + 'There is no completed analyst narrative. ' * 5))
+        def test_ordinary_discussion_of_source_error_is_not_automatically_blocked(self):
+            self.assertTrue(usable_report('A source error was resolved by a successful retry. '
+                'The completed report below uses the resulting financial observations. ' * 2))
+        def test_failed_fundamentals_buy_returns_no_trade(self):
+            reports, receipts = fixtures()
+            reports['fundamentals_report'] = '# Fundamentals Analysis Error\n' + 'Provider failure prevented completion. ' * 5
+            reports['final_trade_intent'] = {'action': 'BUY', 'symbol': 'AAPL'}
+            result = execution_payload(reports, 'BUY', receipts, 'AAPL')
+            self.assertEqual(result['status'], 'ANALYSIS_INCOMPLETE')
+            self.assertEqual(result['signal'], 'NO_TRADE')
+            self.assertEqual(result['model_signal'], 'BUY')
+            self.assertFalse(result['orders_enabled'])
     return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests)).wasSuccessful()
 
 
