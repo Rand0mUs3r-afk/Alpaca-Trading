@@ -154,7 +154,14 @@ def create_fundamentals_analyst(llm, toolkit):
                 count = tool_call_counts.get(signature, 0) + 1
                 tool_call_counts[signature] = count
                 if signature in tool_result_cache:
-                    tool_result = tool_result_cache[signature]
+                    # Keep the full original ToolMessage once; acknowledge the new ID
+                    # without copying the same SEC evidence into every model request.
+                    original_id = tool_result_cache[signature]
+                    tool_result = (
+                        f"Duplicate request. The full result for identical tool name and arguments "
+                        f"is already present in ToolMessage tool_call_id={json.dumps(original_id)}. "
+                        "Reuse that original evidence and finish the analysis; do not request it again."
+                    )
                 elif count > max_same_call_repeats:
                     tool_result = (
                         f"Skipped repeated tool call '{tool_name}' with identical arguments "
@@ -163,7 +170,7 @@ def create_fundamentals_analyst(llm, toolkit):
                 else:
                     try:
                         tool_result = tool_fn.invoke(tool_args) if hasattr(tool_fn, "invoke") else tool_fn.run(**tool_args)
-                        tool_result_cache[signature] = str(tool_result)
+                        tool_result_cache[signature] = call["id"]
                     except Exception as tool_err:
                         tool_result = f"Error running tool '{tool_name}': {type(tool_err).__name__}. No usable result from this call."
                 messages_history.append(ToolMessage(content=str(tool_result), tool_call_id=call["id"]))
