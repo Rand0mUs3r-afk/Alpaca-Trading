@@ -1,8 +1,8 @@
-"""Step 1: paper-only long-entry executor, not yet connected to Actions.
-Requires independently computed evidence_quality and a structured trade_intent.
-Defaults disabled. Dedicated flat paper account only; one symbol/day attempt.
-Planned risk is not a guaranteed loss cap. Brackets activate exits after full fill.
-Run offline checks with: python -m scripts.paper_executor --self-test
+"""Paper-only, disabled-by-default, cash-bounded long-entry executor.
+Requires independently computed evidence quality and structured trade intent.
+Dedicated flat paper account only; one client order ID per symbol/session date.
+Broker acceptance is not fill/protection verification. No automatic resubmission.
+Offline tests: python -m scripts.paper_executor --self-test
 """
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -102,6 +102,9 @@ def plan(analysis, account, asset, quote, clock, now, expected):
     age = (now - stamp(intent.get('generated_at'))).total_seconds()
     if not -5 <= age <= 600:
         raise Blocked('STALE_DECISION')
+    date = stamp(clock['timestamp']).astimezone(ZoneInfo('America/New_York')).date().isoformat()
+    if intent.get('trade_date') != date:
+        raise Blocked('DECISION_SESSION_MISMATCH')
     if asset.get('symbol') != symbol or asset.get('class') != 'us_equity' or asset.get('status') != 'active' or asset.get('tradable') is not True:
         raise Blocked('ASSET_NOT_ELIGIBLE')
     age = (now - stamp(quote.get('t'))).total_seconds()
@@ -125,7 +128,6 @@ def plan(analysis, account, asset, quote, clock, now, expected):
     quantity = int(min(allocation / entry, D('15') / risk).to_integral_value(rounding=ROUND_DOWN))
     if quantity < 1:
         raise Blocked('NO_WHOLE_SHARE_FITS')
-    date = stamp(clock['timestamp']).astimezone(ZoneInfo('America/New_York')).date().isoformat()
     client_id = 'paper-v1-' + date + '-' + symbol
     order = dict(symbol=symbol, qty=str(quantity), side='buy', type='limit',
                  limit_price=str(entry), time_in_force='day', order_class='bracket',
@@ -133,6 +135,53 @@ def plan(analysis, account, asset, quote, clock, now, expected):
                  take_profit={'limit_price': str(target)}, stop_loss={'stop_price': str(stop)})
     return {'order': order, 'planned_risk_usd': str(quantity * risk),
             'notional_usd': str(quantity * entry), 'reward_risk': str(reward / risk)}
+
+
+def order_result(order, client_id, symbol, proposal=None, origin='submit'):
+    """Classify broker evidence without equating acceptance with an executed bracket."""
+    result = {'status': 'SUBMISSION_UNKNOWN', 'submitted': None, 'fill_verified': False,
+              'protection_verified': False, 'client_order_id': client_id,
+              'help': 'Reconcile this client order ID. Do not automatically resubmit.'}
+    if not isinstance(order, dict):
+        return result
+    if (not isinstance(order.get('id'), str) or not order['id'] or
+            order.get('client_order_id') != client_id or order.get('symbol') != symbol or
+            order.get('side') != 'buy' or order.get('order_class') != 'bracket' or
+            order.get('type') != 'limit' or order.get('time_in_force') != 'day' or
+            order.get('extended_hours') is not False):
+        return result
+    try:
+        quantity, filled = number(order.get('qty')), number(order.get('filled_qty'))
+        limit = number(order.get('limit_price'))
+        if quantity < 1 or quantity != quantity.to_integral_value() or not 0 <= filled <= quantity or limit <= 0:
+            return result
+        if proposal is not None:
+            planned = proposal['order']
+            if quantity != number(planned['qty']) or limit != number(planned['limit_price']):
+                return result
+    except (Blocked, KeyError, TypeError):
+        return result
+    status = order.get('status')
+    active = {'accepted', 'pending_new', 'accepted_for_bidding', 'new'}
+    terminal = {'rejected', 'canceled', 'expired', 'done_for_day'}
+    if not isinstance(status, str) or status not in active | terminal | {'partially_filled', 'filled', 'pending_cancel', 'pending_replace', 'replaced', 'stopped', 'suspended', 'calculated'}:
+        return result
+    result.update(submitted=origin != 'existing', broker_status=status, filled_quantity=str(filled))
+    if filled > 0:
+        if (status == 'filled' and filled != quantity) or (status == 'partially_filled' and filled >= quantity):
+            result.update(status='SUBMISSION_UNKNOWN', submitted=None)
+            return result
+        result['status'] = 'FILLED_PROTECTION_UNVERIFIED' if filled == quantity else 'PARTIAL_FILL_PROTECTION_UNVERIFIED'
+        result['help'] = 'Broker reports exposure. Inspect position and both protective legs; do not submit another entry.'
+    elif status in terminal:
+        result['status'] = 'ORDER_TERMINAL_NO_FILL'
+    elif status in active:
+        result['status'] = {'existing': 'EXISTING_ORDER', 'reconcile': 'RECONCILED_ORDER_FOUND'}.get(origin, 'ORDER_ACCEPTED_NOT_FILL_VERIFIED')
+    elif status == 'filled' or status == 'partially_filled':
+        result.update(status='SUBMISSION_UNKNOWN', submitted=None)
+    else:
+        result['status'] = 'ORDER_REQUIRES_REVIEW'
+    return result
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -152,7 +201,6 @@ class PaperBroker:
         if not self.key or not self.secret or not self.expected_id:
             raise Blocked('PAPER_CREDENTIALS_MISSING')
         self.opener = build_opener(NoRedirect())
-
     def _call(self, path, query=None, body=None, data=False):
         base = 'https://data.alpaca.markets' if data else 'https://paper-api.alpaca.markets'
         if not path.startswith('/v2/') or (body is not None and (data or path != '/v2/orders')):
@@ -167,35 +215,24 @@ class PaperBroker:
                 return json.load(response)
         except HTTPError as exc:
             raise BrokerError(exc.code) from None
-
-    def account(self):
-        return self._call('/v2/account')
-    def clock(self):
-        return self._call('/v2/clock')
-    def positions(self):
-        return self._call('/v2/positions')
-    def open_orders(self):
-        return self._call('/v2/orders', {'status': 'open', 'limit': 500})
-    def asset(self, symbol):
-        return self._call('/v2/assets/' + symbol)
+    def account(self): return self._call('/v2/account')
+    def clock(self): return self._call('/v2/clock')
+    def positions(self): return self._call('/v2/positions')
+    def open_orders(self): return self._call('/v2/orders', {'status': 'open', 'limit': 500})
+    def asset(self, symbol): return self._call('/v2/assets/' + symbol)
     def quote(self, symbol):
         return self._call('/v2/stocks/quotes/latest', {'symbols': symbol, 'feed': 'iex'}, data=True)['quotes'][symbol]
     def find(self, client_id):
         try:
             return self._call('/v2/orders:by_client_order_id', {'client_order_id': client_id})
         except BrokerError as exc:
-            if exc.status == 404:
-                return None
+            if exc.status == 404: return None
             raise
-    def submit(self, order):
-        return self._call('/v2/orders', body=order)
+    def submit(self, order): return self._call('/v2/orders', body=order)
 
 
 def execute(analysis, broker, *, enabled=False, now=None):
-    """Future caller must compute evidence quality independently, not ask an LLM to approve it.
-    File installation alone enables nothing. This first engine supports new long entries
-    only; SELL/HOLD do not close positions. Do not share its paper account with another bot.
-    """
+    """New long entries only. SELL/HOLD never close positions. No submit retries."""
     if enabled is not True:
         return {'status': 'DISABLED', 'submitted': False}
     if analysis.get('signal') != 'BUY':
@@ -216,17 +253,20 @@ def execute(analysis, broker, *, enabled=False, now=None):
         client_id = 'paper-v1-' + date + '-' + symbol
         existing = broker.find(client_id)
         if existing:
-            return {'status': 'EXISTING_ORDER', 'submitted': False, 'client_order_id': client_id}
+            return order_result(existing, client_id, symbol, origin='existing')
         if broker.positions() or broker.open_orders():
             raise Blocked('DEDICATED_ACCOUNT_MUST_BE_FLAT')
         asset, quote = broker.asset(symbol), broker.quote(symbol)
-        proposal = plan(analysis, account, asset, quote, clock, now, broker.expected_id)
-        # Recheck account/clock and other orders immediately before submitting.
+        plan(analysis, account, asset, quote, clock, now, broker.expected_id)
         account, clock = broker.account(), broker.clock()
         if broker.positions() or broker.open_orders() or broker.find(client_id):
             raise Blocked('ACCOUNT_CHANGED_BEFORE_SUBMIT')
+        # Refresh both instrument eligibility and prices after the account recheck.
+        asset, quote = broker.asset(symbol), broker.quote(symbol)
         final_now = supplied_now or datetime.now(timezone.utc)
         proposal = plan(analysis, account, asset, quote, clock, final_now, broker.expected_id)
+        if proposal['order']['client_order_id'] != client_id:
+            raise Blocked('SESSION_CHANGED_BEFORE_SUBMIT')
         try:
             order = broker.submit(proposal['order'])
         except Exception as exc:
@@ -235,18 +275,17 @@ def execute(analysis, broker, *, enabled=False, now=None):
             except Exception:
                 existing = None
             if existing:
-                return {'status': 'RECONCILED_ORDER_FOUND', 'submitted': True, 'fill_verified': False,
-                        'client_order_id': client_id}
-            if isinstance(exc, BrokerError) and 400 <= exc.status < 500:
-                return {'status': 'REJECTED', 'submitted': False, 'client_order_id': client_id}
-            return {'status': 'SUBMISSION_UNKNOWN', 'submitted': None, 'client_order_id': client_id,
-                    'help': 'Do not issue a new order ID; reconcile this ID before any retry.'}
-        if (not order.get('id') or order.get('client_order_id') != client_id or
-                order.get('symbol') != symbol or order.get('side') != 'buy'):
-            return {'status': 'SUBMISSION_UNKNOWN', 'submitted': None, 'client_order_id': client_id}
-        return {'status': 'ORDER_ACCEPTED_NOT_FILL_VERIFIED', 'submitted': True,
-                'fill_verified': False, 'client_order_id': client_id,
-                'broker_status': str(order.get('status', 'unknown')), **proposal}
+                return {**proposal, **order_result(existing, client_id, symbol, proposal, 'reconcile')}
+            # 408/409/422/429 may be ambiguous without a successfully reconciled order.
+            if isinstance(exc, BrokerError) and exc.status in (400, 401, 403, 404, 405, 415):
+                return {'status': 'REJECTED', 'submitted': False, 'client_order_id': client_id,
+                        'broker_http_status': exc.status, 'fill_verified': False, 'protection_verified': False}
+            result = {'status': 'SUBMISSION_UNKNOWN', 'submitted': None, 'client_order_id': client_id,
+                      'fill_verified': False, 'protection_verified': False,
+                      'help': 'Do not issue a new order ID; reconcile this ID before any retry.'}
+            if isinstance(exc, BrokerError): result['broker_http_status'] = exc.status
+            return result
+        return {**proposal, **order_result(order, client_id, symbol, proposal)}
 
 
 def self_test():
@@ -254,118 +293,197 @@ def self_test():
     import unittest
     now = stamp('2026-11-12T15:00:00Z')
     def fixture():
-        analysis = {'status': 'ANALYSIS_COMPLETE_NO_ORDERS', 'symbol': 'AAPL', 'signal': 'BUY',
+        return {'status': 'ANALYSIS_COMPLETE_NO_ORDERS', 'symbol': 'AAPL', 'signal': 'BUY',
             'reports': {key + '_report': 'Verified source observations with numeric values and timestamps. ' * 3
                         for key in ('market', 'news', 'fundamentals')},
             'evidence_quality': {'passed': True, 'checked_by': 'deterministic_gate_v1',
                                  'reports': {'market': 'verified', 'news': 'verified', 'fundamentals': 'verified'}},
             'trade_intent': {'schema_version': '1.0', 'symbol': 'AAPL', 'action': 'BUY',
                 'trading_mode': 'investment', 'current_position': 'NEUTRAL', 'target_position': 'LONG',
-                'position_transition': 'OPEN_LONG', 'generated_at': now.isoformat(),
+                'position_transition': 'OPEN_LONG', 'generated_at': now.isoformat(), 'trade_date': '2026-11-12',
                 'risk_controls': {'stop_loss_price': 98, 'take_profit_price': 105}}}
-        return analysis
     class FakeBroker(PaperBroker):
         def __init__(self):
-            self.expected_id = 'paper-test'
-            self.sent = []
-            self.saved = None
-            self.timeout = False
-            self.holdings = []
-        def account(self):
-            return {'id': 'paper-test', 'status': 'ACTIVE', 'cash': '2000', 'equity': '2000'}
-        def clock(self):
-            return {'is_open': True, 'timestamp': now.isoformat(), 'next_close': '2026-11-12T21:00:00Z'}
-        def positions(self):
-            return self.holdings
-        def open_orders(self):
-            return []
-        def find(self, client_id):
-            return self.saved
-        def asset(self, symbol):
-            return {'symbol': symbol, 'class': 'us_equity', 'status': 'active', 'tradable': True}
+            self.expected_id, self.sent, self.saved = 'paper-test', [], None
+            self.timeout, self.holdings, self.quote_calls = False, [], 0
+            self.response_status, self.http_error, self.reconcile_timeout = 'accepted', None, False
+            self.second_ask = None
+        def account(self): return {'id': 'paper-test', 'status': 'ACTIVE', 'cash': '2000', 'equity': '2000'}
+        def clock(self): return {'is_open': True, 'timestamp': now.isoformat(), 'next_close': '2026-11-12T21:00:00Z'}
+        def positions(self): return self.holdings
+        def open_orders(self): return []
+        def find(self, client_id): return self.saved
+        def asset(self, symbol): return {'symbol': symbol, 'class': 'us_equity', 'status': 'active', 'tradable': True}
         def quote(self, symbol):
-            return {'bp': '99.99', 'ap': '100', 't': now.isoformat()}
+            self.quote_calls += 1
+            ask = self.second_ask if self.quote_calls > 1 and self.second_ask is not None else '100'
+            return {'bp': str(number(ask) - D('.01')), 'ap': ask, 't': now.isoformat()}
         def submit(self, order):
             self.sent.append(copy.deepcopy(order))
-            if self.timeout:
-                raise TimeoutError()
-            self.saved = {'id': 'mock-order', 'client_order_id': order['client_order_id'],
-                          'symbol': order['symbol'], 'side': 'buy', 'status': 'accepted'}
+            if self.http_error is not None: raise BrokerError(self.http_error)
+            if self.timeout and not self.reconcile_timeout: raise TimeoutError()
+            self.saved = {**copy.deepcopy(order), 'id': 'mock-order', 'status': self.response_status, 'filled_qty': '0'}
+            if self.reconcile_timeout: raise TimeoutError()
             return self.saved
+    def run(value=None, broker=None):
+        return execute(fixture() if value is None else value, broker or FakeBroker(), enabled=True, now=now)
     class Tests(unittest.TestCase):
+        def test_malformed_status_does_not_escape_classifier(self):
+            broker = FakeBroker(); run(broker=broker)
+            for status in (None, {}, [], 1):
+                row = {**broker.saved, 'status': status}
+                self.assertEqual(order_result(row, row['client_order_id'], 'AAPL')['status'], 'SUBMISSION_UNKNOWN')
+        def test_live_mode_is_refused(self):
+            from unittest.mock import patch
+            with patch.dict(os.environ, {'ALPACA_USE_PAPER': 'false'}, clear=True):
+                with self.assertRaisesRegex(Blocked, 'PAPER_MODE_REQUIRED'): PaperBroker()
+        def test_transport_ignores_live_base_url_and_posts_only_to_paper(self):
+            import io
+            from types import SimpleNamespace
+            from unittest.mock import patch
+            env = {'ALPACA_API_KEY': 'fixture-key', 'ALPACA_SECRET_KEY': 'fixture-secret',
+                   'ALPACA_EXPECTED_PAPER_ACCOUNT_ID': 'paper-test', 'ALPACA_BASE_URL': 'https://api.alpaca.markets'}
+            with patch.dict(os.environ, env, clear=True): broker = PaperBroker()
+            requests = []
+            def opened(request, timeout):
+                requests.append(request)
+                return io.StringIO('{"id":"fixture"}')
+            broker.opener = SimpleNamespace(open=opened)
+            broker.submit({'symbol': 'AAPL'})
+            self.assertEqual(requests[0].full_url, 'https://paper-api.alpaca.markets/v2/orders')
+            self.assertEqual(requests[0].get_method(), 'POST')
+            with self.assertRaises(Blocked): broker._call('/v2/account', body={})
+            with self.assertRaises(Blocked): broker._call('/v2/orders', body={}, data=True)
         def test_disabled(self):
             broker = FakeBroker()
             self.assertEqual(execute(fixture(), broker)['status'], 'DISABLED')
             self.assertFalse(broker.sent)
         def test_hold_does_not_trade(self):
-            value = fixture(); value['signal'] = 'HOLD'
-            self.assertEqual(execute(value, FakeBroker(), enabled=True, now=now)['status'], 'NO_ACTION')
-        def test_complete_buy_builds_protected_cash_order(self):
+            value, broker = fixture(), FakeBroker()
+            value['signal'] = 'HOLD'
+            self.assertEqual(run(value, broker)['status'], 'NO_ACTION')
+            self.assertFalse(broker.sent)
+        def test_complete_buy_keeps_risk_caps_and_bracket(self):
             broker = FakeBroker()
-            result = execute(fixture(), broker, enabled=True, now=now)
-            self.assertTrue(result['submitted'])
+            result = run(broker=broker)
+            self.assertEqual(result['status'], 'ORDER_ACCEPTED_NOT_FILL_VERIFIED')
             self.assertEqual(len(broker.sent), 1)
             self.assertEqual(broker.sent[0]['order_class'], 'bracket')
             self.assertLessEqual(number(result['planned_risk_usd']), 15)
             self.assertLessEqual(number(result['notional_usd']), 500)
+            self.assertFalse(result['fill_verified'])
+            self.assertFalse(result['protection_verified'])
         def test_repeat_does_not_submit_twice(self):
             broker = FakeBroker()
-            execute(fixture(), broker, enabled=True, now=now)
-            self.assertEqual(execute(fixture(), broker, enabled=True, now=now)['status'], 'EXISTING_ORDER')
+            run(broker=broker)
+            self.assertEqual(run(broker=broker)['status'], 'EXISTING_ORDER')
             self.assertEqual(len(broker.sent), 1)
         def test_missing_quality_blocks(self):
-            value = fixture(); value.pop('evidence_quality')
-            broker = FakeBroker()
-            with self.assertRaises(Blocked): execute(value, broker, enabled=True, now=now)
+            value, broker = fixture(), FakeBroker()
+            value.pop('evidence_quality')
+            with self.assertRaises(Blocked): run(value, broker)
             self.assertFalse(broker.sent)
         def test_incomplete_report_blocks(self):
-            value = fixture(); value['reports']['market_report'] = 'The analyst did not return a complete technical narrative. ' * 3
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            value = fixture()
+            value['reports']['market_report'] = 'The analyst did not return a complete technical narrative. ' * 3
+            with self.assertRaises(Blocked): run(value)
         def test_wrong_account_blocks(self):
             broker = FakeBroker(); broker.expected_id = 'wrong'
-            with self.assertRaises(Blocked): execute(fixture(), broker, enabled=True, now=now)
+            with self.assertRaises(Blocked): run(broker=broker)
         def test_existing_positions_block(self):
             broker = FakeBroker(); broker.holdings = [{'symbol': 'OTHER'}]
-            with self.assertRaises(Blocked): execute(fixture(), broker, enabled=True, now=now)
+            with self.assertRaises(Blocked): run(broker=broker)
         def test_missing_stop_blocks(self):
             value = fixture(); value['trade_intent']['risk_controls']['stop_loss_price'] = None
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            with self.assertRaises(Blocked): run(value)
         def test_weak_reward_risk_blocks(self):
             value = fixture(); value['trade_intent']['risk_controls']['take_profit_price'] = 101
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            with self.assertRaises(Blocked): run(value)
         def test_nonfinite_values_block(self):
             value = fixture(); value['trade_intent']['risk_controls']['stop_loss_price'] = 'NaN'
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            with self.assertRaises(Blocked): run(value)
         def test_unknown_submit_is_not_retried(self):
             broker = FakeBroker(); broker.timeout = True
-            self.assertEqual(execute(fixture(), broker, enabled=True, now=now)['status'], 'SUBMISSION_UNKNOWN')
+            self.assertEqual(run(broker=broker)['status'], 'SUBMISSION_UNKNOWN')
             self.assertEqual(len(broker.sent), 1)
         def test_closed_market_blocks(self):
-            broker = FakeBroker()
-            original = broker.clock
+            broker = FakeBroker(); original = broker.clock
             broker.clock = lambda: {**original(), 'is_open': False}
-            with self.assertRaises(Blocked): execute(fixture(), broker, enabled=True, now=now)
+            with self.assertRaises(Blocked): run(broker=broker)
             self.assertFalse(broker.sent)
         def test_stale_quote_blocks(self):
             broker = FakeBroker()
             broker.quote = lambda symbol: {'bp': 99.99, 'ap': 100, 't': '2026-11-12T14:00:00Z'}
-            with self.assertRaises(Blocked): execute(fixture(), broker, enabled=True, now=now)
+            with self.assertRaises(Blocked): run(broker=broker)
             self.assertFalse(broker.sent)
-        def test_stop_above_current_bid_blocks(self):
+        def test_stop_above_bid_blocks(self):
             value = fixture(); value['trade_intent']['risk_controls']['stop_loss_price'] = 100.10
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            with self.assertRaises(Blocked): run(value)
         def test_typographic_refusal_blocks(self):
             value = fixture()
             value['reports']['fundamentals_report'] = ('I can' + chr(0x2019) + 't provide that. ') * 8
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            with self.assertRaises(Blocked): run(value)
         def test_stale_analysis_blocks(self):
             value = fixture(); value['trade_intent']['generated_at'] = '2026-11-11T15:00:00Z'
-            with self.assertRaises(Blocked): execute(value, FakeBroker(), enabled=True, now=now)
+            with self.assertRaises(Blocked): run(value)
+        def test_wrong_session_blocks(self):
+            value = fixture(); value['trade_intent']['trade_date'] = '2026-11-11'
+            with self.assertRaisesRegex(Blocked, 'SESSION_MISMATCH'): run(value)
+        def test_prices_refreshed_before_submit(self):
+            broker = FakeBroker()
+            run(broker=broker)
+            self.assertEqual(broker.quote_calls, 2)
+        def test_adverse_price_move_blocks_submit(self):
+            broker = FakeBroker(); broker.second_ask = '106'
+            with self.assertRaises(Blocked): run(broker=broker)
+            self.assertFalse(broker.sent)
+        def test_terminal_broker_status_not_reported_as_accepted(self):
+            for status in ('rejected', 'canceled', 'expired', 'done_for_day'):
+                broker = FakeBroker(); broker.response_status = status
+                self.assertEqual(run(broker=broker)['status'], 'ORDER_TERMINAL_NO_FILL')
+                self.assertEqual(len(broker.sent), 1)
+        def test_unknown_broker_status_not_reported_as_accepted(self):
+            broker = FakeBroker(); broker.response_status = 'made_up'
+            self.assertEqual(run(broker=broker)['status'], 'SUBMISSION_UNKNOWN')
+        def test_partial_or_full_fill_requires_protection_review(self):
+            broker = FakeBroker(); run(broker=broker)
+            row = copy.deepcopy(broker.saved)
+            for status, quantity, expected in (('partially_filled', '.5', 'PARTIAL_FILL_PROTECTION_UNVERIFIED'),
+                                                ('filled', row['qty'], 'FILLED_PROTECTION_UNVERIFIED')):
+                value = {**row, 'status': status, 'filled_qty': quantity}
+                result = order_result(value, row['client_order_id'], 'AAPL')
+                self.assertEqual(result['status'], expected)
+                self.assertFalse(result['protection_verified'])
+        def test_mismatched_order_identity_or_economics_is_unknown(self):
+            broker = FakeBroker(); outcome = run(broker=broker)
+            for changes in ({'symbol': 'TSLA'}, {'side': 'sell'}, {'order_class': 'simple'},
+                            {'qty': '999'}, {'limit_price': '1'}, {'filled_qty': 'NaN'}, {'id': ''}):
+                value = {**broker.saved, **changes}
+                result = order_result(value, broker.saved['client_order_id'], 'AAPL', outcome)
+                self.assertEqual(result['status'], 'SUBMISSION_UNKNOWN')
+        def test_reconciliation_checks_identity(self):
+            broker = FakeBroker(); run(broker=broker)
+            broker.saved['symbol'] = 'TSLA'
+            self.assertEqual(run(broker=broker)['status'], 'SUBMISSION_UNKNOWN')
+            self.assertEqual(len(broker.sent), 1)
+        def test_timeout_reconciles_same_order_without_resubmission(self):
+            broker = FakeBroker(); broker.reconcile_timeout = True
+            self.assertEqual(run(broker=broker)['status'], 'RECONCILED_ORDER_FOUND')
+            self.assertEqual(len(broker.sent), 1)
+        def test_ambiguous_http_errors_remain_unknown(self):
+            for status in (408, 409, 422, 429, 500):
+                broker = FakeBroker(); broker.http_error = status
+                self.assertEqual(run(broker=broker)['status'], 'SUBMISSION_UNKNOWN')
+                self.assertEqual(len(broker.sent), 1)
+        def test_explicit_request_rejection_is_reported(self):
+            broker = FakeBroker(); broker.http_error = 403
+            self.assertEqual(run(broker=broker)['status'], 'REJECTED')
+            self.assertEqual(len(broker.sent), 1)
     return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests)).wasSuccessful()
 
 
 if __name__ == '__main__':
     import sys
     if sys.argv[1:] != ['--self-test']:
-        raise SystemExit('Not connected to Actions. Only --self-test is supported as a command.')
+        raise SystemExit('Use the paper research runner. Only --self-test is supported here.')
     raise SystemExit(0 if self_test() else 1)
